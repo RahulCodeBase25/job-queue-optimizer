@@ -1,0 +1,287 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Job Queue Optimizer</title>
+<meta name="description" content="Live demo of a priority job queue built with Node.js and Redis: aging, retries with backoff, dead-letter queue, rate limiting and crash recovery." />
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%23172033'/%3E%3Crect x='12' y='18' width='40' height='7' rx='3.5' fill='%23ffb44c'/%3E%3Crect x='12' y='29' width='30' height='7' rx='3.5' fill='%237aa2ff'/%3E%3Crect x='12' y='40' width='20' height='7' rx='3.5' fill='%2394a3b8'/%3E%3C/svg%3E" />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Sans+Condensed:wght@600;700&display=swap" rel="stylesheet" />
+<style>
+  :root {
+    --bg: #eef1f5; --panel: #ffffff; --ink: #172033; --muted: #5d6779; --line: #d8dee8;
+    --accent: #2f5bd8; --high: #c2410c; --normal: #2f5bd8; --low: #64748b;
+    --good: #12805c; --warn: #b26a00; --bad: #c02a3a;
+    --track: #e4e9f1;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #0f1522; --panel: #172033; --ink: #e8edf6; --muted: #9aa6bb; --line: #2a3549;
+      --accent: #7aa2ff; --high: #ff9a5c; --normal: #7aa2ff; --low: #9aa6bb;
+      --good: #38c793; --warn: #f2b14c; --bad: #ff6b7d; --track: #222d42;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink); font: 15px/1.5 "IBM Plex Sans", system-ui, sans-serif; }
+  .wrap { max-width: 1180px; margin: 0 auto; padding: 24px 16px 48px; }
+  header { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 8px 24px; }
+  h1 { font: 700 clamp(26px, 4vw, 36px)/1.1 "IBM Plex Sans Condensed", sans-serif; margin: 0; letter-spacing: -0.01em; }
+  h2 { font: 700 18px/1.2 "IBM Plex Sans Condensed", sans-serif; margin: 0 0 12px; }
+  .sub { color: var(--muted); margin: 6px 0 0; max-width: 62ch; }
+  .meta { color: var(--muted); font-size: 14px; display: flex; gap: 14px; flex-wrap: wrap; }
+  .meta a { color: var(--accent); }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 18px; }
+  .num { font-variant-numeric: tabular-nums; }
+
+  /* The pipeline: where jobs are right now */
+  .pipe { margin-top: 20px; display: grid; grid-template-columns: 1fr auto 1fr auto 1fr; align-items: stretch; gap: 10px; }
+  .stage { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 14px 16px; }
+  .stage .label { color: var(--muted); font-size: 13px; font-weight: 600; }
+  .stage .big { font: 700 34px/1.1 "IBM Plex Sans Condensed", sans-serif; margin-top: 2px; }
+  .stage .note { color: var(--muted); font-size: 13px; margin-top: 4px; }
+  .arrow { align-self: center; color: var(--muted); font-size: 22px; }
+  .side { margin-top: 10px; display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
+  .side .stage .big { font-size: 26px; }
+  .bad .big { color: var(--bad); } .warn .big { color: var(--warn); } .good .big { color: var(--good); }
+
+  .grid2 { margin-top: 16px; display: grid; grid-template-columns: 1.4fr 1fr; gap: 16px; }
+  .controls { display: grid; gap: 14px; }
+  .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  label.f { display: grid; gap: 4px; font-size: 13px; font-weight: 600; color: var(--muted); }
+  select, input[type=range] { font: inherit; }
+  select { padding: 7px 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); color: var(--ink); }
+  button { font: 600 14px "IBM Plex Sans", sans-serif; padding: 9px 14px; border-radius: 9px; border: 1px solid var(--line); background: var(--panel); color: var(--ink); cursor: pointer; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button:disabled { opacity: .55; cursor: default; }
+  :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .msg { font-size: 13px; color: var(--muted); min-height: 1.2em; }
+
+  /* Throughput chart */
+  .chart { position: relative; height: 230px; }
+  input[type=range] { accent-color: var(--accent); }
+  .chart svg { width: 100%; height: 100%; display: block; overflow: visible; }
+  .tip { position: absolute; pointer-events: none; background: var(--ink); color: var(--panel); font-size: 12px; padding: 4px 8px; border-radius: 6px; white-space: nowrap; transform: translate(-50%, -130%); display: none; }
+
+  /* Event feed and dead letters */
+  ul.feed { list-style: none; margin: 0; padding: 0; max-height: 330px; overflow: auto; font-size: 14px; }
+  ul.feed li { display: grid; grid-template-columns: 92px 1fr auto; gap: 10px; align-items: baseline; padding: 6px 0; border-bottom: 1px solid var(--line); }
+  .badge { font-size: 12px; font-weight: 700; display: inline-flex; gap: 5px; align-items: center; }
+  .badge.completed { color: var(--good); } .badge.retrying { color: var(--warn); } .badge.dead { color: var(--bad); }
+  .prio { font-size: 12px; font-weight: 700; }
+  .prio.high { color: var(--high); } .prio.normal { color: var(--normal); } .prio.low { color: var(--low); }
+  .muted { color: var(--muted); }
+  table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  th, td { text-align: left; padding: 7px 6px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { color: var(--muted); font-weight: 600; font-size: 13px; }
+  .how { margin-top: 16px; display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
+  .how div { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 14px 16px; }
+  .how h3 { margin: 0 0 4px; font-size: 15px; }
+  .how p { margin: 0; color: var(--muted); font-size: 14px; }
+
+  @media (max-width: 860px) {
+    .pipe { grid-template-columns: 1fr; } .arrow { transform: rotate(90deg); justify-self: center; }
+    .grid2 { grid-template-columns: 1fr; } .how { grid-template-columns: 1fr 1fr; } .chart { height: 170px; } .side { grid-template-columns: 1fr 1fr 1fr; }
+  }
+  @media (max-width: 480px) { .side, .how { grid-template-columns: 1fr; } ul.feed li { grid-template-columns: 84px 1fr; } ul.feed li .when { display: none; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div>
+      <h1>Job Queue Optimizer</h1>
+      <p class="sub">A priority job queue for Node.js and Redis. Add some jobs and watch the workers pick them up in priority order, retry failures and park the hopeless ones.</p>
+    </div>
+    <div class="meta">
+      <span id="store">Connecting…</span>
+      <span id="workers"></span>
+      <a href="https://github.com/RahulCodeBase25/job-queue-optimizer" target="_blank" rel="noopener">Source on GitHub</a>
+    </div>
+  </header>
+
+  <section aria-label="Where jobs are right now">
+    <div class="pipe">
+      <div class="stage"><div class="label">Waiting</div><div class="big num" id="s-waiting">0</div><div class="note">Ready to run, best score first</div></div>
+      <div class="arrow" aria-hidden="true">→</div>
+      <div class="stage"><div class="label">Active</div><div class="big num" id="s-active">0</div><div class="note">Running on a worker</div></div>
+      <div class="arrow" aria-hidden="true">→</div>
+      <div class="stage good"><div class="label">Completed</div><div class="big num" id="s-completed">0</div><div class="note"><span class="num" id="s-throughput">0</span> jobs/s over the last 10 s</div></div>
+    </div>
+    <div class="side">
+      <div class="stage warn"><div class="label">Delayed</div><div class="big num" id="s-delayed">0</div><div class="note">Waiting for a retry or a rate-limit slot</div></div>
+      <div class="stage warn"><div class="label">Retries so far</div><div class="big num" id="s-retried">0</div><div class="note">Failed tries that were scheduled again</div></div>
+      <div class="stage bad"><div class="label">Dead-letter queue</div><div class="big num" id="s-dead">0</div><div class="note">Out of attempts, kept for inspection</div></div>
+    </div>
+  </section>
+
+  <div class="grid2">
+    <section class="panel" aria-labelledby="h-tp">
+      <h2 id="h-tp">Completed jobs per second, last 2 minutes</h2>
+      <div class="chart" id="chart"><svg id="svg" role="img" aria-label="Throughput over the last 2 minutes"></svg><div class="tip" id="tip"></div></div>
+    </section>
+
+    <section class="panel controls" aria-labelledby="h-add">
+      <h2 id="h-add">Add jobs</h2>
+      <div class="row">
+        <label class="f">How many
+          <select id="count"><option>10</option><option selected>50</option><option>200</option></select>
+        </label>
+        <label class="f">Type
+          <select id="type"><option value="">Mixed</option><option value="email">Send email</option><option value="report">Generate report</option><option value="data-sync">Sync data</option></select>
+        </label>
+        <label class="f">Priority
+          <select id="priority"><option value="">Mixed</option><option value="high">High</option><option value="normal">Normal</option><option value="low">Low</option></select>
+        </label>
+      </div>
+      <div class="row"><button class="primary" id="add">Add jobs</button></div>
+      <label class="f" for="chaos">Extra failure rate: <span id="chaos-val" class="num">0%</span>
+        <input type="range" id="chaos" min="0" max="80" step="10" value="0" />
+      </label>
+      <p class="msg" id="msg" role="status"></p>
+    </section>
+  </div>
+
+  <div class="grid2">
+    <section class="panel" aria-labelledby="h-feed">
+      <h2 id="h-feed">Live events</h2>
+      <ul class="feed" id="feed"><li class="muted" style="display:block">Nothing yet. Add some jobs.</li></ul>
+    </section>
+    <section class="panel" aria-labelledby="h-dead">
+      <h2 id="h-dead">Dead-letter queue</h2>
+      <div style="overflow:auto"><table><thead><tr><th>Job</th><th>Last error</th><th></th></tr></thead><tbody id="dead"><tr><td colspan="3" class="muted">Empty. Turn up the failure rate to fill it.</td></tr></tbody></table></div>
+    </section>
+  </div>
+
+  <section class="how" aria-label="How it works">
+    <div><h3>Priority with aging</h3><p>Score = priority level × 15 s + time queued. Low jobs wait longer but can never be starved.</p></div>
+    <div><h3>Retries with backoff</h3><p>Failures retry after an exponential delay with jitter, so a flaky service isn't hammered.</p></div>
+    <div><h3>Dead-letter queue</h3><p>After the last attempt a job is parked with its error, and can be retried by hand.</p></div>
+    <div><h3>Rate limits</h3><p>Token buckets cap emails and data syncs per second. Throttled jobs wait without losing an attempt.</p></div>
+    <div><h3>Atomic claims</h3><p>A Redis Lua script hands each job to exactly one worker, even with many processes.</p></div>
+    <div><h3>Crash recovery</h3><p>Jobs that were running when a process died go back to the queue on restart.</p></div>
+  </section>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const fmt = new Intl.NumberFormat();
+const history = []; // [{t, v}] throughput samples, one per second
+const MAX_POINTS = 120;
+
+function setStats(s) {
+  if (!s || s.waiting === undefined) return;
+  $("store").textContent = s.store === "redis" ? "Storage: Redis" : "Storage: in memory";
+  $("workers").textContent = `${s.concurrency} workers`;
+  for (const k of ["waiting", "active", "completed", "delayed", "retried"]) $("s-" + k).textContent = fmt.format(s[k]);
+  $("s-dead").textContent = fmt.format(s.deadQueue);
+  $("s-throughput").textContent = s.throughput;
+  const pct = Math.round((s.extraFailure || 0) * 100);
+  if (document.activeElement !== $("chaos")) { $("chaos").value = pct; $("chaos-val").textContent = pct + "%"; }
+  history.push({ t: Date.now(), v: s.throughput });
+  if (history.length > MAX_POINTS) history.shift();
+  drawChart();
+}
+
+// Single-series line chart: 2px line, light fill, recessive grid, crosshair tooltip on hover
+function drawChart() {
+  const svg = $("svg");
+  const w = svg.clientWidth, h = svg.clientHeight, padL = 30, padB = 18, padT = 6;
+  const max = Math.max(5, ...history.map((p) => p.v));
+  const niceMax = Math.ceil(max / 5) * 5;
+  const x = (i) => padL + (i / (MAX_POINTS - 1)) * (w - padL - 4);
+  const offset = MAX_POINTS - history.length;
+  const y = (v) => padT + (1 - v / niceMax) * (h - padT - padB);
+  const css = getComputedStyle(document.documentElement);
+  const accent = css.getPropertyValue("--accent").trim(), line = css.getPropertyValue("--line").trim(), muted = css.getPropertyValue("--muted").trim();
+  let out = "";
+  for (const g of [0, niceMax / 2, niceMax]) {
+    out += `<line x1="${padL}" x2="${w - 4}" y1="${y(g)}" y2="${y(g)}" stroke="${line}" stroke-width="1"/>`;
+    out += `<text x="${padL - 6}" y="${y(g) + 4}" text-anchor="end" font-size="11" fill="${muted}">${g}</text>`;
+  }
+  out += `<text x="${padL}" y="${h - 2}" font-size="11" fill="${muted}">2 min ago</text><text x="${w - 4}" y="${h - 2}" text-anchor="end" font-size="11" fill="${muted}">now</text>`;
+  if (history.length > 1) {
+    const pts = history.map((p, i) => `${x(i + offset).toFixed(1)},${y(p.v).toFixed(1)}`);
+    out += `<polygon points="${x(offset)},${y(0)} ${pts.join(" ")} ${x(MAX_POINTS - 1)},${y(0)}" fill="${accent}" fill-opacity="0.12"/>`;
+    out += `<polyline points="${pts.join(" ")}" fill="none" stroke="${accent}" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>`;
+  }
+  out += `<line id="cross" y1="${padT}" y2="${h - padB}" stroke="${muted}" stroke-dasharray="3 3" visibility="hidden"/><circle id="dot" r="4" fill="${accent}" stroke="var(--panel)" stroke-width="2" visibility="hidden"/>`;
+  svg.innerHTML = out;
+  svg.onmousemove = (e) => {
+    if (history.length < 2) return;
+    const r = svg.getBoundingClientRect();
+    const i = Math.round(((e.clientX - r.left - padL) / (w - padL - 4)) * (MAX_POINTS - 1)) - offset;
+    const p = history[Math.max(0, Math.min(history.length - 1, i))];
+    const idx = history.indexOf(p) + offset;
+    const cross = $("cross"), dot = $("dot"), tip = $("tip");
+    cross.setAttribute("x1", x(idx)); cross.setAttribute("x2", x(idx)); cross.setAttribute("visibility", "visible");
+    dot.setAttribute("cx", x(idx)); dot.setAttribute("cy", y(p.v)); dot.setAttribute("visibility", "visible");
+    tip.style.display = "block"; tip.style.left = x(idx) + "px"; tip.style.top = y(p.v) + "px";
+    tip.textContent = `${p.v} jobs/s · ${Math.round((Date.now() - p.t) / 1000)} s ago`;
+  };
+  svg.onmouseleave = () => { $("tip").style.display = "none"; $("cross")?.setAttribute("visibility", "hidden"); $("dot")?.setAttribute("visibility", "hidden"); };
+}
+
+const ICON = { completed: "✓", retrying: "↻", dead: "✕" };
+const LABEL = { completed: "Done", retrying: "Retrying", dead: "Dead" };
+function addEvent({ event, job }) {
+  const feed = $("feed");
+  if (feed.firstElementChild?.classList.contains("muted")) feed.innerHTML = "";
+  const li = document.createElement("li");
+  let detail = `<span class="prio ${job.priority}">${job.priority}</span> ${job.type} <span class="muted">#${job.id}</span>`;
+  if (event === "retrying") detail += ` <span class="muted">· try ${job.attempts}/${job.maxAttempts} failed, again in ${(job.retryInMs / 1000).toFixed(1)} s</span>`;
+  if (event === "dead") detail += ` <span class="muted">· ${escapeHtml(job.error || "")}</span>`;
+  li.innerHTML = `<span class="badge ${event}">${ICON[event]} ${LABEL[event]}</span><span>${detail}</span><span class="when muted num">${event === "completed" ? job.durationMs + " ms" : ""}</span>`;
+  feed.prepend(li);
+  while (feed.children.length > 60) feed.lastElementChild.remove();
+  if (event === "dead") loadDead();
+}
+
+function escapeHtml(s) { return s.replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c])); }
+
+async function loadDead() {
+  const list = await fetch("/api/jobs?list=dead&limit=15").then((r) => r.json()).catch(() => []);
+  const body = $("dead");
+  if (!list.length) { body.innerHTML = `<tr><td colspan="3" class="muted">Empty. Turn up the failure rate to fill it.</td></tr>`; return; }
+  body.innerHTML = list.map((j) => `<tr><td><span class="prio ${j.priority}">${j.priority}</span> ${j.type}<br><span class="muted">#${j.id} · ${j.attempts} tries</span></td><td>${escapeHtml(j.lastError || "")}</td><td><button data-id="${j.id}">Retry</button></td></tr>`).join("");
+}
+
+$("dead").addEventListener("click", async (e) => {
+  const id = e.target.dataset?.id;
+  if (!id) return;
+  e.target.disabled = true;
+  const r = await fetch(`/api/jobs/${id}/retry`, { method: "POST" });
+  $("msg").textContent = r.ok ? `Job #${id} is back in the queue.` : "Couldn't retry that job.";
+  loadDead();
+});
+
+$("add").addEventListener("click", async () => {
+  const btn = $("add");
+  btn.disabled = true;
+  const body = { count: Number($("count").value) };
+  if ($("type").value) body.type = $("type").value;
+  if ($("priority").value) body.priority = $("priority").value;
+  try {
+    const r = await fetch("/api/jobs/bulk", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    const data = await r.json();
+    $("msg").textContent = r.ok ? `Added ${data.added} jobs.` : data.message;
+  } catch { $("msg").textContent = "Couldn't reach the server. It may be waking up; try again in a few seconds."; }
+  btn.disabled = false;
+});
+
+$("chaos").addEventListener("input", (e) => ($("chaos-val").textContent = e.target.value + "%"));
+$("chaos").addEventListener("change", async (e) => {
+  const r = await fetch("/api/chaos", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ extraFailure: Number(e.target.value) / 100 }) });
+  $("msg").textContent = r.ok ? `Extra failure rate set to ${e.target.value}%.` : "Couldn't change the failure rate.";
+});
+
+const events = new EventSource("/api/events");
+events.addEventListener("stats", (e) => setStats(JSON.parse(e.data)));
+events.addEventListener("job", (e) => addEvent(JSON.parse(e.data)));
+events.onerror = () => { $("store").textContent = "Reconnecting…"; };
+window.addEventListener("resize", drawChart);
+loadDead();
+</script>
+</body>
+</html>

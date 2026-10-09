@@ -1,0 +1,26 @@
+# One-click deploy on Render: a web service (API + dashboard + workers)
+# and a free Key Value (Redis-compatible) instance it talks to privately.
+services:
+  - type: web
+    name: job-queue-optimizer
+    runtime: node
+    plan: free
+    buildCommand: npm ci --omit=dev
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_VERSION
+        value: "22"
+      - key: CONCURRENCY
+        value: "4"
+      - key: REDIS_URL
+        fromService:
+          type: keyvalue
+          name: job-queue-redis
+          property: connectionString
+
+  - type: keyvalue
+    name: job-queue-redis
+    plan: free
+    maxmemoryPolicy: noeviction # a queue must never silently drop jobs
+    ipAllowList: [] # private network only

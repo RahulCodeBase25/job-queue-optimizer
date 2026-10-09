@@ -1,0 +1,20 @@
+{
+  "name": "job-queue-optimizer",
+  "version": "1.0.0",
+  "description": "A priority job queue for Node.js with Redis: aging to prevent starvation, retries with backoff, dead-letter queue, rate limiting, crash recovery and a live dashboard.",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js",
+    "test": "node --test --test-timeout=30000 test/*.test.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "author": "Rahul Singh",
+  "license": "MIT",
+  "dependencies": {
+    "express": "^5.3.0",
+    "ioredis": "^6.0.0"
+  }
+}
